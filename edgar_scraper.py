@@ -4,131 +4,306 @@ from bs4 import BeautifulSoup
 import time
 from datetime import datetime
 import os
+from pathlib import Path
 import logging
+import json
+from typing import Optional, List, Dict
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import backoff
+import sqlite3
+from tqdm import tqdm
 
 class EDGARScraper:
-    def __init__(self, email):
+    def __init__(self, email: str, output_dir: str = "def14a_filings", max_retries: int = 3):
         """
-        Initialize the scraper with your email (required by SEC)
+        Initialize the scraper
+        :param email: Email for SEC tracking
+        :param output_dir: Directory to save filings
+        :param max_retries: Maximum number of retries for failed requests
         """
         self.headers = {
             'User-Agent': f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 {email}'
         }
         self.base_url = "https://www.sec.gov/Archives"
-        logging.basicConfig(level=logging.INFO)
+        self.output_dir = output_dir
+        self.max_retries = max_retries
+
+        # Create directories
+        Path(output_dir).mkdir(exist_ok=True)
+        Path(output_dir + '/logs').mkdir(exist_ok=True)
+
+        # Setup logging
+        self._setup_logging()
+
+        # Initialize database
+        self.db_path = os.path.join(output_dir, 'filings.db')
+        self._setup_database()
+
+    def _setup_logging(self):
+        """Configure logging with both file and console handlers"""
+        log_file = os.path.join(self.output_dir, 'logs', f'scraper_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler()
+            ]
+        )
         self.logger = logging
 
-    def get_company_ciks(self):
-        """
-        Get a list of all company CIKs from SEC
-        """
+    def _setup_database(self):
+        """Initialize SQLite database for tracking scraping progress"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS filings (
+                    cik TEXT,
+                    filing_date TEXT,
+                    file_path TEXT,
+                    status TEXT,
+                    last_updated TIMESTAMP,
+                    url TEXT,
+                    PRIMARY KEY (cik, filing_date)
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS companies (
+                    cik TEXT PRIMARY KEY,
+                    name TEXT,
+                    last_scraped TIMESTAMP
+                )
+            ''')
+
+    @backoff.on_exception(backoff.expo,
+                         (requests.exceptions.RequestException,
+                          requests.exceptions.HTTPError),
+                         max_tries=3)
+    def _make_request(self, url: str) -> requests.Response:
+        """Make request with exponential backoff retry"""
+        time.sleep(0.1)  # SEC rate limit
+        response = requests.get(url, headers=self.headers)
+        response.raise_for_status()
+        return response
+
+    def get_company_ciks(self) -> List[str]:
+        """Get list of company CIKs from SEC"""
         try:
             url = "https://www.sec.gov/files/company_tickers.json"
-            response = requests.get(url, headers=self.headers)
-            response.raise_for_status()
+            response = self._make_request(url)
             data = response.json()
 
             # Convert to DataFrame and zero-pad CIKs to 10 digits
             df = pd.DataFrame.from_dict(data, orient='index')
             df['cik_str'] = df['cik_str'].astype(str).str.zfill(10)
+
+            # Save to database
+            with sqlite3.connect(self.db_path) as conn:
+                for _, row in df.iterrows():
+                    conn.execute('''
+                        INSERT OR REPLACE INTO companies (cik, name)
+                        VALUES (?, ?)
+                    ''', (row['cik_str'], row['title']))
+
             return df['cik_str'].tolist()
         except Exception as e:
             self.logger.error(f"Error getting company CIKs: {str(e)}")
             return []
 
-    def get_def14a_links(self, cik):
-        """
-        Get all DEF 14A filing links for a given CIK
-        """
+    def get_filing_links(self, cik: str, filing_type: str = "DEF 14A", limit: int = 5) -> List[Dict]:
+        """Get DEF 14A filing links for a company"""
+        url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type={filing_type.replace(' ', '+')}&dateb=&owner=exclude&count={limit}"
+
         try:
-            url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=DEF+14A&dateb=&owner=exclude&count=100"
-            response = requests.get(url, headers=self.headers)
-            response.raise_for_status()
-
+            response = self._make_request(url)
             soup = BeautifulSoup(response.text, 'html.parser')
-            documents = []
 
-            # Find all document links
-            for row in soup.find_all('tr'):
-                if row.find('td', text='DEF 14A'):
-                    doc_link = row.find('a', {'id': 'documentsbutton'})
-                    if doc_link:
-                        documents.append(f"https://www.sec.gov{doc_link['href']}")
+            filings = []
+            doc_table = soup.find('table', {'class': 'tableFile2'})
 
-            return documents
+            if not doc_table:
+                self.logger.warning(f"No filings found for CIK {cik}")
+                return []
+
+            for row in doc_table.find_all('tr')[1:]:
+                cols = row.find_all('td')
+                if len(cols) >= 4:
+                    filing_type = cols[0].text.strip()
+                    if filing_type == "DEF 14A":
+                        filing_date = cols[3].text.strip()
+                        doc_link = cols[1].find('a')
+                        if doc_link:
+                            doc_href = doc_link['href']
+                            filings.append({
+                                'filing_type': filing_type,
+                                'filing_date': filing_date,
+                                'doc_url': f"https://www.sec.gov{doc_href}"
+                            })
+
+            return filings
+
         except Exception as e:
-            self.logger.error(f"Error getting DEF 14A links for CIK {cik}: {str(e)}")
+            self.logger.error(f"Error getting filing links for CIK {cik}: {str(e)}")
             return []
 
-    def download_filing(self, doc_url, output_dir):
-        """
-        Download a specific filing and save it
-        """
+    def get_filing_content(self, doc_url: str) -> Optional[str]:
+        """Get the actual DEF 14A filing content"""
         try:
-            # Get the document page
-            response = requests.get(doc_url, headers=self.headers)
-            response.raise_for_status()
+            response = self._make_request(doc_url)
             soup = BeautifulSoup(response.text, 'html.parser')
 
-            # Find the actual filing link
-            filing_link = soup.find('a', {'href': lambda x: x and x.endswith('.htm')})
-            if filing_link:
-                filing_url = f"https://www.sec.gov{filing_link['href']}"
+            # Look specifically for the DEF 14A document link
+            filing_link = None
+            for link in soup.find_all('a'):
+                href = link.get('href', '')
+                if 'def14a.htm' in href.lower():
+                    filing_link = f"https://www.sec.gov{href}"
+                    break
 
-                # Download the filing
-                filing_response = requests.get(filing_url, headers=self.headers)
-                filing_response.raise_for_status()
+            if not filing_link:
+                for link in soup.find_all('a'):
+                    href = link.get('href', '')
+                    text = link.get_text().lower()
+                    if '.htm' in href and 'def 14a' in text:
+                        filing_link = f"https://www.sec.gov{href}"
+                        break
 
-                # Create filename from URL
-                filename = os.path.join(output_dir,
-                                      f"{doc_url.split('/')[-2]}_{filing_link['href'].split('/')[-1]}")
+            if not filing_link:
+                return None
 
-                # Save the filing
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(filing_response.text)
+            response = self._make_request(filing_link)
+            content = response.text
 
-                self.logger.info(f"Successfully downloaded: {filename}")
-                return True
+            if 'proxy statement' in content.lower():
+                return content
 
-            return False
+            return None
+
         except Exception as e:
-            self.logger.error(f"Error downloading filing {doc_url}: {str(e)}")
+            self.logger.error(f"Error getting filing content from {doc_url}: {str(e)}")
+            return None
+
+    def validate_filing_content(self, content: str) -> bool:
+        """Validate filing content"""
+        if not content:
             return False
 
-    def scrape_all_def14a(self, output_dir="def14a_filings"):
-        """
-        Main function to scrape all DEF 14A filings
-        """
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
+        soup = BeautifulSoup(content, 'html.parser')
+        text_content = soup.get_text().lower()
 
-        # Get all company CIKs
-        ciks = self.get_company_ciks()
-        self.logger.info(f"Found {len(ciks)} companies")
+        required_terms = [
+            r'proxy\s+statement',
+            r'(executive\s+compensation|compensation\s+discussion)',
+            r'(board\s+of\s+directors|corporate\s+governance)',
+            r'(stock|share)\s+(ownership|holdings)',
+        ]
 
-        # Track progress
-        total_downloaded = 0
+        matches = 0
+        for term in required_terms:
+            if re.search(term, text_content, re.IGNORECASE):
+                matches += 1
 
-        # Process each company
-        for cik in ciks:
-            # Respect SEC rate limit (10 requests per second)
-            time.sleep(0.1)
+        basic_valid = matches >= 2
+        has_proxy = re.search(r'proxy\s+statement', text_content, re.IGNORECASE)
 
-            # Get all DEF 14A filings for this company
-            filing_links = self.get_def14a_links(cik)
+        return basic_valid and has_proxy
 
-            for link in filing_links:
-                time.sleep(0.1)  # Rate limiting
-                if self.download_filing(link, output_dir):
-                    total_downloaded += 1
+    def process_filing(self, cik: str, filing: Dict) -> bool:
+        """Process a single filing"""
+        try:
+            # Check if already processed
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute('''
+                    SELECT status FROM filings
+                    WHERE cik = ? AND filing_date = ?
+                ''', (cik, filing['filing_date']))
+                result = cursor.fetchone()
+                if result and result[0] == 'completed':
+                    return True
 
-            self.logger.info(f"Processed CIK {cik}: Found {len(filing_links)} filings")
+            content = self.get_filing_content(filing['doc_url'])
+            if not content or not self.validate_filing_content(content):
+                self._update_filing_status(cik, filing, 'invalid')
+                return False
 
-        self.logger.info(f"Scraping completed. Total filings downloaded: {total_downloaded}")
+            # Save valid filing
+            clean_date = filing['filing_date'].replace('/', '-')
+            filename = f"{cik}_{clean_date}_def14a.htm"
+            filepath = os.path.join(self.output_dir, filename)
+
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+            self._update_filing_status(cik, filing, 'completed', filepath)
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error processing filing {filing['doc_url']}: {str(e)}")
+            self._update_filing_status(cik, filing, 'error')
+            return False
+
+    def _update_filing_status(self, cik: str, filing: Dict, status: str, filepath: str = None):
+        """Update filing status in database"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''
+                INSERT OR REPLACE INTO filings
+                (cik, filing_date, file_path, status, last_updated, url)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                cik,
+                filing['filing_date'],
+                filepath,
+                status,
+                datetime.now(),
+                filing['doc_url']
+            ))
+
+    def process_company(self, cik: str) -> None:
+        """Process all filings for a company"""
+        self.logger.info(f"Processing CIK {cik}")
+
+        filings = self.get_filing_links(cik)
+        if not filings:
+            return
+
+        for filing in filings:
+            try:
+                self.process_filing(cik, filing)
+            except Exception as e:
+                self.logger.error(f"Error processing CIK {cik}: {str(e)}")
+
+    def run(self, ciks: List[str] = None, max_workers: int = 4):
+        """Run the scraper"""
+        if not ciks:
+            ciks = self.get_company_ciks()
+
+        self.logger.info(f"Processing {len(ciks)} companies")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(self.process_company, cik) for cik in ciks]
+            for future in tqdm(as_completed(futures), total=len(futures)):
+                try:
+                    future.result()
+                except Exception as e:
+                    self.logger.error(f"Error in worker thread: {str(e)}")
+
+def main():
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    email = os.getenv("SEC_EMAIL")
+    if not email:
+        raise ValueError("Please set SEC_EMAIL in .env file")
+
+    scraper = EDGARScraper(email)
+
+    # Optional: Process specific CIKs
+    # test_ciks = ['0000320193', '0000789019', '0001652044']  # Apple, Microsoft, Google
+    # scraper.run(test_ciks)
+
+    # Or process all companies
+    scraper.run()
 
 if __name__ == "__main__":
-    # Initialize scraper with your email
-    scraper = EDGARScraper("dd367@cornell.edu")
-
-    # Start scraping
-    scraper.scrape_all_def14a()
+    main()
