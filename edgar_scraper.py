@@ -1,18 +1,20 @@
-import requests
-import pandas as pd
-from bs4 import BeautifulSoup
-import time
-from datetime import datetime
-import os
-from pathlib import Path
-import logging
 import json
-from typing import Optional, List, Dict
+import logging
+import os
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import backoff
 import sqlite3
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import backoff
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
 from tqdm import tqdm
+
 
 class EDGARScraper:
     def __init__(self, email: str, output_dir: str = "def14a_filings", max_retries: int = 3):

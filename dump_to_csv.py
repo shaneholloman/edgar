@@ -1,8 +1,10 @@
-import sqlite3
-import json
 import csv
-from typing import List, Dict
-from schema import Executive, Education
+import json
+import sqlite3
+from typing import Dict, List
+
+from schema import Education, Executive
+
 
 def dump_to_csv(output_file: str = 'executives.csv'):
     """Dump executive data to CSV with expanded education fields"""

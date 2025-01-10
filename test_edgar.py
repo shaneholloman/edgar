@@ -1,11 +1,13 @@
-import requests
-import time
-from bs4 import BeautifulSoup
-import os
-from pathlib import Path
 import logging
-from typing import Optional, List, Dict
+import os
 import re
+import time
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import requests
+from bs4 import BeautifulSoup
+
 
 class EDGARValidator:
     def __init__(self, email: str):

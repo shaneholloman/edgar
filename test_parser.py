@@ -1,14 +1,16 @@
-from dataclasses import dataclass
-from typing import List, Optional, Dict
-from datetime import datetime
-import os
-from pathlib import Path
-import sqlite3
-from bs4 import BeautifulSoup
-from openai import OpenAI
 import json
-from dotenv import load_dotenv
+import os
 import re
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from openai import OpenAI
+
 
 @dataclass
 class Education:

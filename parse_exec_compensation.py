@@ -1,15 +1,18 @@
-from dataclasses import dataclass
-from typing import List, Optional, Dict, Tuple
-from datetime import datetime
-import os
-from pathlib import Path
-import sqlite3
-from bs4 import BeautifulSoup
-from openai import OpenAI
 import json
-from dotenv import load_dotenv
+import os
 import re
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from openai import OpenAI
+
 from schema import Education, Executive
+
 
 def get_latest_def14a(cik: str) -> Optional[str]:
     """Get the latest DEF 14A filing content from the SQLite database"""
